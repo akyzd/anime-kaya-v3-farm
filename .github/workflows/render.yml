@@ -4,7 +4,7 @@
 # (base64) karena upload lewat konektor GitHub Muse hanya mendukung teks.
 # Job render/stitch mendekode semuanya sebelum render (langkah
 # "Decode base64 assets"). audio/mix.wav TIDAK disimpan di repo — job
-# stitch merakitnya dari 5 MP3 narasi (langkah "Build mix.wav").
+# stitch merakitnya dari MP3 narasi — 5 file untuk AnimeKayaV3, 8 file untuk AnimeGaji3Jt (langkah "Build mix.wav").
 #
 # Cara kerja:
 #   1. `prepare` membagi 1500 frame jadi 10 chunk (masing-masing 150 frame).
@@ -158,8 +158,13 @@ jobs:
 
       - name: Build mix.wav from narration MP3s
         run: |
-          for f in 01-hook 02-koneksi 03-nutrisi 04-branding 05-penutup; do echo "file 'public/anime/audio-charon/$f.mp3'"; done > narration.txt
-          ffmpeg -y -v error -f concat -safe 0 -i narration.txt -vn -ar 48000 -ac 2 -af apad=whole_dur=50.5 audio/mix.wav
+          if [ "${{ inputs.composition }}" = "AnimeGaji3Jt" ]; then
+            for f in 01-hook 02-turn 03-budget 04-habits 05-enam-bulan 06-satu-tahun 07-penutup 08-cta; do echo "file 'public/anime-gaji3jt/audio-charon/$f.mp3'"; done > narration.txt
+            ffmpeg -y -v error -f concat -safe 0 -i narration.txt -vn -ar 48000 -ac 2 -af apad=whole_dur=164.7 audio/mix.wav
+          else
+            for f in 01-hook 02-koneksi 03-nutrisi 04-branding 05-penutup; do echo "file 'public/anime/audio-charon/$f.mp3'"; done > narration.txt
+            ffmpeg -y -v error -f concat -safe 0 -i narration.txt -vn -ar 48000 -ac 2 -af apad=whole_dur=50.5 audio/mix.wav
+          fi
           ls -la audio/mix.wav
 
       - name: Stitch frames + audio into final MP4

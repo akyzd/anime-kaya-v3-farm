@@ -1,0 +1,182 @@
+# Render "3 Pengeluaran yang Justru Bikin Kaya" (AnimeKayaV3) di farm paralel GitHub Actions.
+#
+# Catatan: aset biner (JPG/MP3) disimpan di repo sebagai file .b64
+# (base64) karena upload lewat konektor GitHub Muse hanya mendukung teks.
+# Job render/stitch mendekode semuanya sebelum render (langkah
+# "Decode base64 assets"). audio/mix.wav TIDAK disimpan di repo — job
+# stitch merakitnya dari 5 MP3 narasi (langkah "Build mix.wav").
+#
+# Cara kerja:
+#   1. `prepare` membagi 1500 frame jadi 10 chunk (masing-masing 150 frame).
+#   2. `render-chunk` menjalankan 10 job paralel. Tiap job checkout repo ini,
+#      install dependensi Node, lalu render HANYA range frame-nya sebagai
+#      JPEG sequence dengan Remotion (`--frames=start-end --sequence`),
+#      lalu upload frame sebagai artifact. Tidak ada encoding video di sini.
+#   3. `stitch` mengunduh semua artifact chunk, mengurutkan frame berdasarkan
+#      nomor frame global, memeriksa tidak ada yang hilang, lalu menggabungkan
+#      dengan ffmpeg jadi MP4 1080x1920, dengan audio/mix.wav di-mux masuk.
+#      Video jadi di-upload sebagai artifact `final-video`.
+#
+# Template workflow ini diadaptasi dari Cukurzembood/geosfacts-render
+# (farm render Remotion paralel, MIT-style public template). Proyek
+# Remotion-nya diganti dengan AnimeKayaV3 (React 18, Remotion 4.0.545).
+# Farm aslinya (codet-render-farm) merender frame kartun three.js, bukan
+# Remotion — jadi repo ini yang dipakai untuk video Remotion.
+#
+# Biaya: job paralel menghemat WAKTU, bukan menit Actions. 10 job x ~5-10 mnt
+# = ~50-100 menit Actions per render. Repo PUBLIK = menit Actions gratis
+# tidak terbatas. Kalau repo ini dibuat privat, jatah gratis 2.000 mnt/bulan.
+
+name: Render AnimeKayaV3 (parallel)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: 'Composition ID to render'
+        required: true
+        default: 'AnimeKayaV3'
+        type: string
+      total_frames:
+        description: 'Total frames in the composition (AnimeKayaV3 = 1500)'
+        required: true
+        default: '1500'
+        type: string
+      chunks:
+        description: 'Number of parallel render jobs (runners)'
+        required: true
+        default: '10'
+        type: string
+      scale:
+        description: 'Render scale (1 = 1080x1920)'
+        required: true
+        default: '1'
+        type: string
+      jpeg_quality:
+        description: 'JPEG quality for chunk frames (70-100)'
+        required: true
+        default: '90'
+        type: string
+      crf:
+        description: 'x264 CRF for the final video (lower = better)'
+        required: true
+        default: '16'
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/render.yml'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.chunks.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: chunks
+        run: |
+          MATRIX=$(python3 scripts/compute-chunks.py \
+            --total-frames "${{ inputs.total_frames }}" \
+            --chunks "${{ inputs.chunks }}")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  render-chunk:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode base64 assets
+        run: |
+          for f in $(find public audio -name '*.b64' -type f); do base64 -d "$f" > "${f%.b64}"; done
+          ls -la public/anime/img public/anime/audio-charon audio
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Teks video memakai Noto Sans (ExtraBold) + Noto Serif Italic.
+      # Runner ubuntu-latest tidak dijamin membawa font itu, jadi install
+      # dulu supaya headline tampil sama seperti render lokal.
+      - name: Install Noto fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-core && fc-cache -f
+
+      # Headless software GL: GitHub runner tidak punya GPU. `swangle`
+      # adalah backend yang sama dengan default Remotion Lambda/Cloud Run.
+      # --frames=start-end inklusif; --sequence menulis satu JPEG per
+      # frame bernama element-<nomor-frame-global>.jpg ke output dir.
+      - name: Render frames ${{ matrix.start }}-${{ matrix.end }}
+        run: |
+          npx remotion render src/index.ts "${{ inputs.composition }}" "out/chunk-${{ matrix.chunk }}" \
+            --frames="${{ matrix.start }}-${{ matrix.end }}" \
+            --sequence --image-format=jpeg --jpeg-quality="${{ inputs.jpeg_quality }}" \
+            --gl=swangle --scale="${{ inputs.scale }}" --log=info
+        env:
+          CI: 'true'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frames-chunk-${{ matrix.chunk }}
+          path: out/chunk-${{ matrix.chunk }}/
+          retention-days: 1
+
+  stitch:
+    needs: render-chunk
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode base64 assets
+        run: |
+          for f in $(find public audio -name '*.b64' -type f); do base64 -d "$f" > "${f%.b64}"; done
+          ls -la public/anime/img public/anime/audio-charon audio
+
+      # Semua artifact chunk digabung ke satu folder. Nama file adalah
+      # nomor frame global, jadi tidak ada tabrakan antar chunk.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: frames-chunk-*
+          path: frames/
+          merge-multiple: true
+
+      # Runner ubuntu-latest TIDAK membawa ffmpeg: install dulu.
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Build mix.wav from narration MP3s
+        run: |
+          for f in 01-hook 02-koneksi 03-nutrisi 04-branding 05-penutup; do echo "file 'public/anime/audio-charon/$f.mp3'"; done > narration.txt
+          ffmpeg -y -v error -f concat -safe 0 -i narration.txt -vn -ar 48000 -ac 2 -af apad=whole_dur=50.5 audio/mix.wav
+          ls -la audio/mix.wav
+
+      - name: Stitch frames + audio into final MP4
+        run: |
+          python3 scripts/stitch.py --frames-dir frames --fps 30 \
+            --audio audio/mix.wav --output final.mp4 \
+            --total-frames "${{ inputs.total_frames }}" --crf "${{ inputs.crf }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: final.mp4
+          retention-days: 7
+
+      - name: Publish final video as release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v3-render-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" final.mp4 --title "AnimeKayaV3 render $TAG" --notes "Render farm AnimeKayaV3 (50 detik, 1080x1920). Video final dari artifact final-video." 
